@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NETJAIL_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+CODEX_NETJAIL_ALLOW="${CODEX_NETJAIL_ALLOW-}"
+CODEX_NETJAIL_OLLAMA="${CODEX_NETJAIL_OLLAMA:-127.0.0.1:11434}"
+CODEX_NETJAIL_CMD="${CODEX_NETJAIL_CMD:-codex --oss --local-provider ollama}"
+CODEX_NETJAIL_LOG="${CODEX_NETJAIL_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/codex-netjail/connect.log}"
+CODEX_NETJAIL_RUN="${CODEX_NETJAIL_RUN:-${XDG_RUNTIME_DIR:-/tmp}/codex-netjail.$$}"
+PROXY_PORT=3128
+RELAY_PIDS=()
+
+die() { echo "codex-netjail: $*" >&2; exit 1; }
+
+require_tools() {
+  local tool
+  for tool in unshare ip python3; do
+    command -v "$tool" >/dev/null || die "$tool not found: install it (util-linux, iproute2, python)"
+  done
+}
+
+relay() {
+  python3 -I "$NETJAIL_HOME/netjail_relay.py" "$@" &
+  RELAY_PIDS+=("$!")
+}
+
+wait_for_socket() {
+  local path=$1 tries=50
+  until [ -S "$path" ]; do
+    tries=$((tries - 1))
+    [ "$tries" -gt 0 ] || die "relay socket $path did not appear: check $CODEX_NETJAIL_LOG and python3"
+    sleep 0.1
+  done
+}
+
+wait_for_port() {
+  local port=$1 tries=50
+  until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+    tries=$((tries - 1))
+    [ "$tries" -gt 0 ] || die "bridge on 127.0.0.1:$port did not start inside the namespace"
+    sleep 0.1
+  done
+}
+
+stop_relays() {
+  [ "${#RELAY_PIDS[@]}" -eq 0 ] || kill "${RELAY_PIDS[@]}" 2>/dev/null || true
+}
+
+start_host_relays() {
+  mkdir -p "$CODEX_NETJAIL_RUN" "$(dirname "$CODEX_NETJAIL_LOG")"
+  chmod 700 "$CODEX_NETJAIL_RUN"
+  relay proxy "$CODEX_NETJAIL_RUN/proxy.sock" "$CODEX_NETJAIL_LOG" "$CODEX_NETJAIL_ALLOW"
+  relay unix-to-tcp "$CODEX_NETJAIL_RUN/ollama.sock" "$CODEX_NETJAIL_OLLAMA"
+  wait_for_socket "$CODEX_NETJAIL_RUN/proxy.sock"
+  wait_for_socket "$CODEX_NETJAIL_RUN/ollama.sock"
+}
+
+start_namespace_bridges() {
+  local ollama_port=${CODEX_NETJAIL_OLLAMA##*:}
+  relay tcp-to-unix "$PROXY_PORT" "$CODEX_NETJAIL_RUN/proxy.sock"
+  relay tcp-to-unix "$ollama_port" "$CODEX_NETJAIL_RUN/ollama.sock"
+  wait_for_port "$PROXY_PORT"
+  wait_for_port "$ollama_port"
+}
+
+run_inside_namespace() {
+  local host_uid=$1 host_gid=$2
+  shift 2
+  ip link set lo up
+  trap stop_relays EXIT
+  start_namespace_bridges
+  local proxy="http://127.0.0.1:$PROXY_PORT"
+  # shellcheck disable=SC2086
+  HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" https_proxy="$proxy" http_proxy="$proxy" \
+    ALL_PROXY="$proxy" all_proxy="$proxy" \
+    NO_PROXY=127.0.0.1,localhost,::1 no_proxy=127.0.0.1,localhost,::1 \
+    unshare --user --map-user="$host_uid" --map-group="$host_gid" $CODEX_NETJAIL_CMD "$@"
+}
+
+main() {
+  if [ "${1-}" = "--inside-namespace" ]; then
+    shift
+    run_inside_namespace "$@"
+    return
+  fi
+  require_tools
+  trap 'stop_relays; rm -rf "$CODEX_NETJAIL_RUN"' EXIT
+  start_host_relays
+  CODEX_NETJAIL_RUN="$CODEX_NETJAIL_RUN" unshare --user --map-root-user --net \
+    "$NETJAIL_HOME/codex-netjail" --inside-namespace "$(id -u)" "$(id -g)" "$@"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then main "$@"; fi
